@@ -3,3 +3,16 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# Python virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
