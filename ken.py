@@ -1,4 +1,4 @@
-import urllib.request
+﻿import urllib.request
 import urllib.parse
 import http.cookiejar
 import json
@@ -79,6 +79,59 @@ def fmt_date(d):
     return d.strftime('%Y-%m-%d')
 
 
+def redistribute_supply(daily_net, daily_last_time):
+    """
+    For gaps between net_cum dates, fill both missing days AND
+    boundary partial-day hours using hourly rate.
+    hourly_rate = (net_cum[B] - net_cum[A]) / (last_time[B] - last_time[A]) in hours
+    Boundary A: fills hours after last record (TA -> 24:00)
+    Boundary B: fills hours from midnight to last record (0:00 -> TB)
+    Missing full days: each gets hourly_rate * 24
+    Returns dict of date -> daily_supply for all dates covered by net_cum.
+    """
+    net_dates = sorted(daily_net.keys())
+    result = {}
+
+    # First pass: consecutive dates (gap == 1)
+    for i in range(len(net_dates) - 1):
+        curr = net_dates[i]
+        next_date = net_dates[i + 1]
+        gap = (next_date - curr).days
+        if gap == 1:
+            result[next_date] = round(daily_net[next_date] - daily_net[curr], 2)
+
+    # Second pass: handle gaps and fill boundary partial days
+    for i in range(len(net_dates) - 1):
+        curr = net_dates[i]
+        next_date = net_dates[i + 1]
+        gap = (next_date - curr).days
+
+        if gap > 1:
+            t_curr = daily_last_time[curr]
+            t_next = daily_last_time[next_date]
+            time_gap_hours = (t_next - t_curr).total_seconds() / 3600
+            total_flow = daily_net[next_date] - daily_net[curr]
+            hourly_rate = total_flow / time_gap_hours
+
+            # Fill remaining hours on boundary curr (last record time -> 24:00)
+            curr_frac = t_curr.hour + t_curr.minute / 60.0 + t_curr.second / 3600.0
+            remaining_curr = 24 - curr_frac
+            if remaining_curr > 0:
+                result[curr] = result.get(curr, 0) + round(hourly_rate * remaining_curr, 2)
+
+            # Fill missing full days between curr and next_date (exclusive)
+            d = curr + timedelta(days=1)
+            while d < next_date:
+                result[d] = round(hourly_rate * 24, 2)
+                d += timedelta(days=1)
+
+            # Supply for boundary next_date (0:00 -> last record time)
+            next_frac = t_next.hour + t_next.minute / 60.0 + t_next.second / 3600.0
+            result[next_date] = result.get(next_date, 0) + round(hourly_rate * next_frac, 2)
+
+    return result
+
+
 def main(params=None):
     base_url = 'http://www.shanghaikent.com:18601'
     username = 'scmy'
@@ -114,6 +167,7 @@ def main(params=None):
     print('  目标提取范围:', fmt_date(start_target_date), 'to', fmt_date(end_target_date))
     print('  预计提取天数:', (end_target_date - start_target_date).days + 1)
     all_rows = []
+    all_gaps = []
     for mid, addr in meters:
         raw = fetch_meter_data(base_url, mid, begin, end, cookie_header)
         if not raw:
@@ -142,26 +196,84 @@ def main(params=None):
             d = r['date']
             if 2 <= r['hour'] <= 4:
                 daily_flows.setdefault(d, []).append(r['flow'])
+
+        # Build average 2-4am flow per date
+        daily_avg_flow = {}
+        for d, flows in daily_flows.items():
+            if flows:
+                daily_avg_flow[d] = sum(flows) / len(flows)
         
         daily_net = {}
+        daily_last_time = {}
         for r in sorted(records, key=lambda x: x['dt']):
             daily_net[r['date']] = r['net_cum']
+            daily_last_time[r['date']] = r['dt']
         
-        net_sorted = sorted(daily_net.items())
-        daily_supply = {}
-        for i in range(1, len(net_sorted)):
-            daily_supply[net_sorted[i][0]] = net_sorted[i][1] - net_sorted[i - 1][1]
+        # Redistribute supply across gaps using hourly rate
+        redistributed = redistribute_supply(daily_net, daily_last_time)
+
+        # Collect gap info for log file
+        net_dates_log = sorted(daily_net.keys())
+        for gi in range(len(net_dates_log) - 1):
+            gc = net_dates_log[gi]
+            gn = net_dates_log[gi + 1]
+            if (gn - gc).days > 1:
+                t_gc = daily_last_time[gc]
+                t_gn = daily_last_time[gn]
+                time_gap_hours = (t_gn - t_gc).total_seconds() / 3600
+                total_gap = daily_net[gn] - daily_net[gc]
+                hourly_gap = total_gap / time_gap_hours
+                daily_gap = round(hourly_gap * 24, 2)
+                span_gap = (gn - gc).days + 1
+                affected = []
+                dt = gc
+                while dt <= gn:
+                    affected.append(fmt_date(dt))
+                    dt += timedelta(days=1)
+                all_gaps.append({
+                    'meter': addr,
+                    'from': fmt_date(gc),
+                    'to': fmt_date(gn),
+                    'span_days': span_gap,
+                    'time_gap_hours': round(time_gap_hours, 2),
+                    'total_supply': round(total_gap, 2),
+                    'hourly_rate': round(hourly_gap, 2),
+                    'daily_supply': daily_gap,
+                    'affected_dates': ' | '.join(affected),
+                })
         
         matched_days = [d for d in daily_flows.keys() if start_target_date <= d <= end_target_date]
-        print('     目标范围内有效天数:', len(matched_days), '天')
+        data_date_count = len(matched_days)
+        # Generate full date range for the target window
+        full_range = []
+        d = start_target_date
+        while d <= end_target_date:
+            full_range.append(d)
+            d += timedelta(days=1)
+
+        # Identify dates with redistributed supply (filled by gap redistribution)
+        orig_supply_dates = set()
+        net_sorted = sorted(daily_net.items())
+        for i in range(1, len(net_sorted)):
+            if (net_sorted[i][0] - net_sorted[i-1][0]).days == 1:
+                orig_supply_dates.add(net_sorted[i][0])
+
+
+        filled_supply_dates = [d for d in full_range if d in redistributed and d not in orig_supply_dates]
+
+        print('     目标范围内有效天数:', data_date_count, '天')
+        if len(full_range) > data_date_count:
+            if filled_supply_dates:
+                print('     补齐明细（日期: 日供水量）:')
+                for fd in filled_supply_dates:
+                    print(f'       {fmt_date(fd)}: {redistributed[fd]:.2f}')
         
-        for d in matched_days:
-            flows = daily_flows[d]
+        for d in full_range:
             all_rows.append({
                 '时间': fmt_date(d),
                 '地址': addr,
-                '瞬时流量': round(sum(flows) / len(flows), 2),
-                '日供水量': round(daily_supply.get(d, 0), 2),
+                '瞬时流量': round(daily_avg_flow.get(d, 0), 2),
+                '日供水量': round(redistributed.get(d, 0), 2),
             })
         print('   +', addr, '- OK')
     if not all_rows:
@@ -188,7 +300,36 @@ def main(params=None):
         print(f'  CSV 文件已成功生成: {csv_file_path}')
     except Exception as e:
         print(f'  生成 CSV 文件失败: {e}')
-        
+
+    # 生成缺失数据日志
+    log_path = 'data_log.txt'
+    try:
+        with open(log_path, 'w', encoding='utf-8') as f:
+            f.write('=' * 60 + '\n')
+            f.write('上海肯特漏水控制管理平台 - 数据补齐日志\n')
+            f.write('=' * 60 + '\n')
+            f.write(f'执行日期: {fmt_date(datetime.now().date())}\n')
+            f.write(f'目标范围: {fmt_date(start_target_date)} ~ {fmt_date(end_target_date)}\n')
+            f.write('\n')
+            if not all_gaps:
+                f.write('未发现缺失数据，无需补齐。\n')
+            else:
+                for g in all_gaps:
+                    f.write(f'监测点: ' + str(g["meter"]) + '\n')
+                    f.write(f'  缺失日期范围: ' + str(g["from"]) + ' ~ ' + str(g["to"]) + '\n')
+                    f.write(f'  涵盖天数: ' + str(g["span_days"]) + ' 天\n')
+
+                    f.write(f'  时间跨度: ' + str(g["time_gap_hours"]) + ' 小时\n')
+                    f.write(f'  缺口时段总供水量: ' + str(round(g["total_supply"], 2)) + '\n')
+                    f.write(f'  平均小时流量: ' + str(round(g["hourly_rate"], 2)) + '\n')
+                    f.write(f'  折合整日日供水量: ' + str(round(g["daily_supply"], 2)) + '\n')
+                    f.write(f'  受影响日期: ' + str(g["affected_dates"]) + '\n')
+                    f.write('\n')
+            f.write('=' * 60 + '\n')
+            f.write(f'共 {len(all_gaps)} 个缺口被补齐\n')
+        print(f'  日志文件已生成: {log_path}')
+    except Exception as e:
+        print(f'  生成日志文件失败: {e}')
     result = {}
     for idx, row in enumerate(all_rows, 1):
         result['dataPoint' + str(idx)] = row
