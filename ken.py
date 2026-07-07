@@ -81,53 +81,43 @@ def fmt_date(d):
 
 def redistribute_supply(daily_net, daily_last_time):
     """
-    For gaps between net_cum dates, fill both missing days AND
-    boundary partial-day hours using hourly rate.
+    Calculate daily water supply based on net cumulative values and record times.
+    For each pair of consecutive data dates, calculate hourly rate and distribute
+    the total flow proportionally across all days in the interval, accounting for
+    the actual record time on boundary dates.
+    
     hourly_rate = (net_cum[B] - net_cum[A]) / (last_time[B] - last_time[A]) in hours
-    Boundary A: fills hours after last record (TA -> 24:00)
-    Boundary B: fills hours from midnight to last record (0:00 -> TB)
-    Missing full days: each gets hourly_rate * 24
+    Day A share: hourly_rate * (24 - hour_fraction_of_A)
+    Missing full days: hourly_rate * 24
+    Day B share: hourly_rate * hour_fraction_of_B
     Returns dict of date -> daily_supply for all dates covered by net_cum.
     """
     net_dates = sorted(daily_net.keys())
     result = {}
 
-    # First pass: consecutive dates (gap == 1)
-    for i in range(len(net_dates) - 1):
-        curr = net_dates[i]
-        next_date = net_dates[i + 1]
-        gap = (next_date - curr).days
-        if gap == 1:
-            result[next_date] = round(daily_net[next_date] - daily_net[curr], 2)
-
-    # Second pass: handle gaps and fill boundary partial days
     for i in range(len(net_dates) - 1):
         curr = net_dates[i]
         next_date = net_dates[i + 1]
         gap = (next_date - curr).days
 
-        if gap > 1:
-            t_curr = daily_last_time[curr]
-            t_next = daily_last_time[next_date]
-            time_gap_hours = (t_next - t_curr).total_seconds() / 3600
-            total_flow = daily_net[next_date] - daily_net[curr]
-            hourly_rate = total_flow / time_gap_hours
+        t_curr = daily_last_time[curr]
+        t_next = daily_last_time[next_date]
+        time_gap_hours = (t_next - t_curr).total_seconds() / 3600
+        total_flow = daily_net[next_date] - daily_net[curr]
+        hourly_rate = total_flow / time_gap_hours
 
-            # Fill remaining hours on boundary curr (last record time -> 24:00)
-            curr_frac = t_curr.hour + t_curr.minute / 60.0 + t_curr.second / 3600.0
-            remaining_curr = 24 - curr_frac
-            if remaining_curr > 0:
-                result[curr] = result.get(curr, 0) + round(hourly_rate * remaining_curr, 2)
+        curr_frac = t_curr.hour + t_curr.minute / 60.0 + t_curr.second / 3600.0
+        remaining_curr = 24 - curr_frac
+        if remaining_curr > 0:
+            result[curr] = result.get(curr, 0) + round(hourly_rate * remaining_curr, 2)
 
-            # Fill missing full days between curr and next_date (exclusive)
-            d = curr + timedelta(days=1)
-            while d < next_date:
-                result[d] = round(hourly_rate * 24, 2)
-                d += timedelta(days=1)
+        d = curr + timedelta(days=1)
+        while d < next_date:
+            result[d] = round(hourly_rate * 24, 2)
+            d += timedelta(days=1)
 
-            # Supply for boundary next_date (0:00 -> last record time)
-            next_frac = t_next.hour + t_next.minute / 60.0 + t_next.second / 3600.0
-            result[next_date] = result.get(next_date, 0) + round(hourly_rate * next_frac, 2)
+        next_frac = t_next.hour + t_next.minute / 60.0 + t_next.second / 3600.0
+        result[next_date] = result.get(next_date, 0) + round(hourly_rate * next_frac, 2)
 
     return result
 
