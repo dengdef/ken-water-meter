@@ -214,6 +214,30 @@ def main(params=None):
 
         # Collect gap info for log file
         net_dates_log = sorted(daily_net.keys())
+        
+        # Check for gap at start of target range
+        if net_dates_log and net_dates_log[0] > start_target_date:
+            first_data_date = net_dates_log[0]
+            gap_days = (first_data_date - start_target_date).days
+            if gap_days > 0:
+                affected = []
+                dt = start_target_date
+                while dt <= first_data_date:
+                    affected.append(fmt_date(dt))
+                    dt += timedelta(days=1)
+                all_gaps.append({
+                    'meter': addr,
+                    'from': fmt_date(start_target_date),
+                    'to': fmt_date(first_data_date),
+                    'span_days': gap_days + 1,
+                    'time_gap_hours': round(gap_days * 24, 2),
+                    'total_supply': round(daily_net[first_data_date], 2),
+                    'hourly_rate': 0,
+                    'daily_supply': 0,
+                    'affected_dates': ' | '.join(affected),
+                })
+        
+        # Check gaps between existing data dates
         for gi in range(len(net_dates_log) - 1):
             gc = net_dates_log[gi]
             gn = net_dates_log[gi + 1]
@@ -239,6 +263,28 @@ def main(params=None):
                     'total_supply': round(total_gap, 2),
                     'hourly_rate': round(hourly_gap, 2),
                     'daily_supply': daily_gap,
+                    'affected_dates': ' | '.join(affected),
+                })
+        
+        # Check for gap at end of target range
+        if net_dates_log and net_dates_log[-1] < end_target_date:
+            last_data_date = net_dates_log[-1]
+            gap_days = (end_target_date - last_data_date).days
+            if gap_days > 0:
+                affected = []
+                dt = last_data_date
+                while dt <= end_target_date:
+                    affected.append(fmt_date(dt))
+                    dt += timedelta(days=1)
+                all_gaps.append({
+                    'meter': addr,
+                    'from': fmt_date(last_data_date),
+                    'to': fmt_date(end_target_date),
+                    'span_days': gap_days + 1,
+                    'time_gap_hours': round(gap_days * 24, 2),
+                    'total_supply': 0,
+                    'hourly_rate': 0,
+                    'daily_supply': 0,
                     'affected_dates': ' | '.join(affected),
                 })
         
@@ -311,22 +357,118 @@ def main(params=None):
             f.write(f'执行日期: {fmt_date(datetime.now().date())}\n')
             f.write(f'目标范围: {fmt_date(start_target_date)} ~ {fmt_date(end_target_date)}\n')
             f.write('\n')
-            if not all_gaps:
-                f.write('未发现缺失数据，无需补齐。\n')
-            else:
-                for g in all_gaps:
-                    f.write(f'监测点: ' + str(g["meter"]) + '\n')
-                    f.write(f'  缺失日期范围: ' + str(g["from"]) + ' ~ ' + str(g["to"]) + '\n')
-                    f.write(f'  涵盖天数: ' + str(g["span_days"]) + ' 天\n')
-
-                    f.write(f'  时间跨度: ' + str(g["time_gap_hours"]) + ' 小时\n')
-                    f.write(f'  缺口时段总供水量: ' + str(round(g["total_supply"], 2)) + '\n')
-                    f.write(f'  平均小时流量: ' + str(round(g["hourly_rate"], 2)) + '\n')
-                    f.write(f'  折合整日日供水量: ' + str(round(g["daily_supply"], 2)) + '\n')
-                    f.write(f'  受影响日期: ' + str(g["affected_dates"]) + '\n')
-                    f.write('\n')
+            
             f.write('=' * 60 + '\n')
-            f.write(f'共 {len(all_gaps)} 个缺口被补齐\n')
+            f.write('一、补齐逻辑说明\n')
+            f.write('=' * 60 + '\n')
+            f.write('1. 原始数据获取:\n')
+            f.write('   - 从平台获取每个监测点的瞬时流量和净累积量数据\n')
+            f.write('   - 瞬时流量: 取凌晨2-4点的平均值\n')
+            f.write('   - 日供水量: 基于净累积量差值计算\n')
+            f.write('\n')
+            f.write('2. 数据补齐规则:\n')
+            f.write('   - 对于连续日期(gap=1): 日供水量 = 次日净累积量 - 当日净累积量\n')
+            f.write('   - 对于有缺口的日期(gap>1): 使用小时平均流量进行插值补齐\n')
+            f.write('     公式: hourly_rate = (净累积量B - 净累积量A) / 时间差(小时)\n')
+            f.write('     公式: 补齐日供水量 = hourly_rate * 24\n')
+            f.write('   - 边界日期: 根据记录时间计算部分时段供水量\n')
+            f.write('\n')
+            f.write('3. 缺失判定:\n')
+            f.write('   - 目标范围内无原始数据的日期视为缺失\n')
+            f.write('   - 有原始数据但凌晨2-4点无流量记录的日期,瞬时流量记为0\n')
+            f.write('\n')
+            
+            f.write('=' * 60 + '\n')
+            f.write('二、各监测点数据明细与补齐对比\n')
+            f.write('=' * 60 + '\n')
+            
+            meter_data = {}
+            for row in all_rows:
+                addr = row['地址']
+                if addr not in meter_data:
+                    meter_data[addr] = []
+                meter_data[addr].append(row)
+            
+            for addr, rows in meter_data.items():
+                f.write(f'\n监测点: {addr}\n')
+                f.write('-' * 50 + '\n')
+                f.write(f'{"日期":<12} {"状态":<8} {"原值(瞬时流量)":<16} {"补齐后(瞬时流量)":<20} {"原值(日供水量)":<16} {"补齐后(日供水量)":<20}\n')
+                f.write('-' * 50 + '\n')
+                
+                for row in rows:
+                    has_original_flow = row['瞬时流量'] > 0
+                    has_original_supply = row['日供水量'] > 0
+                    
+                    if has_original_flow and has_original_supply:
+                        status = '原始数据'
+                        orig_flow = row['瞬时流量']
+                        filled_flow = row['瞬时流量']
+                        orig_supply = row['日供水量']
+                        filled_supply = row['日供水量']
+                    elif has_original_supply:
+                        status = '部分补齐'
+                        orig_flow = '-'
+                        filled_flow = row['瞬时流量']
+                        orig_supply = row['日供水量']
+                        filled_supply = row['日供水量']
+                    elif row['日供水量'] > 0:
+                        status = '补齐数据'
+                        orig_flow = '-'
+                        filled_flow = row['瞬时流量']
+                        orig_supply = '-'
+                        filled_supply = row['日供水量']
+                    else:
+                        status = '数据缺失'
+                        orig_flow = '-'
+                        filled_flow = '-'
+                        orig_supply = '-'
+                        filled_supply = '-'
+                    
+                    f.write(f'{row["时间"]:<12} {status:<8} ')
+                    if orig_flow == '-':
+                        f.write(f'{orig_flow:<16} ')
+                    else:
+                        f.write(f'{orig_flow:<16.2f} ')
+                    if filled_flow == '-':
+                        f.write(f'{filled_flow:<20} ')
+                    else:
+                        f.write(f'{filled_flow:<20.2f} ')
+                    if orig_supply == '-':
+                        f.write(f'{orig_supply:<16} ')
+                    else:
+                        f.write(f'{orig_supply:<16.2f} ')
+                    if filled_supply == '-':
+                        f.write(f'{filled_supply:<20}\n')
+                    else:
+                        f.write(f'{filled_supply:<20.2f}\n')
+            
+            f.write('\n')
+            f.write('=' * 60 + '\n')
+            f.write('三、缺失数据缺口详情\n')
+            f.write('=' * 60 + '\n')
+            
+            if all_gaps:
+                for g in all_gaps:
+                    f.write(f'\n监测点: {g["meter"]}\n')
+                    f.write(f'  缺失日期范围: {g["from"]} ~ {g["to"]}\n')
+                    f.write(f'  涵盖天数: {g["span_days"]} 天\n')
+                    f.write(f'  受影响日期: {g["affected_dates"]}\n')
+                    if g["hourly_rate"] > 0:
+                        f.write(f'\n  补齐逻辑:\n')
+                        f.write(f'    时间跨度: {g["time_gap_hours"]} 小时\n')
+                        f.write(f'    缺口时段总供水量: {round(g["total_supply"], 2)}\n')
+                        f.write(f'    平均小时流量: {round(g["hourly_rate"], 2)} (计算公式: 总供水量 / 时间跨度)\n')
+                        f.write(f'    折合整日日供水量: {round(g["daily_supply"], 2)} (计算公式: 平均小时流量 * 24)\n')
+                        f.write(f'\n  补齐公式:\n')
+                        f.write(f'    hourly_rate = (净累积量[{g["to"]}] - 净累积量[{g["from"]}]) / {g["time_gap_hours"]}小时\n')
+                        f.write(f'    每日补齐值 = hourly_rate * 24\n')
+                    else:
+                        f.write(f'  状态: 此缺口位于目标范围边界，无原始数据可用于插值计算\n')
+            
+            f.write('\n')
+            f.write('=' * 60 + '\n')
+            f.write(f'共 {len(all_gaps)} 个数据缺口\n')
+            f.write('=' * 60 + '\n')
         print(f'  日志文件已生成: {log_path}')
     except Exception as e:
         print(f'  生成日志文件失败: {e}')
